@@ -39,6 +39,9 @@ std::string getPlatformInfoString(cl_platform_id platform, cl_platform_info para
 	std::string platformInfo(platformInfoSize, '\0'); // обсудили в личке с @PolarNick239, с C++17 удобнее использовать стринг (https://en.cppreference.com/cpp/string/basic_string/data)
 	OCL_SAFE_CALL(clGetPlatformInfo(platform, param, platformInfoSize, platformInfo.data(), nullptr));
 
+	// Нашел что OpenCL включает завершающий '\0' в размер, поэтому исключаем его из содержимого строки
+	platformInfo.pop_back();
+
 	return platformInfo;
 }
 
@@ -50,6 +53,7 @@ T getDeviceInfo(cl_device_id device, cl_device_info param){
         
         std::string result(paramSize, '\0');
         OCL_SAFE_CALL(clGetDeviceInfo(device, param, paramSize, result.data(), nullptr));
+        result.pop_back();
         return result;
     } else {
         T result{};
