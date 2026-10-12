@@ -1,6 +1,3 @@
-
-
-
 #include <libgpu/context.h>
 #include <libgpu/work_size.h>
 #include <libgpu/shared_device_buffer.h>
@@ -211,8 +208,8 @@ void matrix_multiply_wmma_pipeline(const half* a, const half* b, float* __restri
                 const float v = __shfl_xor_sync(0xffffffffu, right ? d[1] : d[5], 2);
                 const unsigned row = blockY + warpY * WMMA_WM + i * 16 + groupRow + halfGroup + (lane & 1) + r;
                 const unsigned col = blockX + warpX * WMMA_WN + j * 16 + groupCol + (right ? 4 : 0);
-                *reinterpret_cast<float4*>(c + size_t(row) * w + col) = right
-                    ? make_float4(u, v, a, b) : make_float4(a, b, u, v);
+                __stcs(reinterpret_cast<float4*>(c + size_t(row) * w + col), right
+                    ? make_float4(u, v, a, b) : make_float4(a, b, u, v));
             }
         }
     }
