@@ -14,8 +14,8 @@
 
 namespace {
 namespace wmma = nvcuda::wmma;
-constexpr unsigned int WMMA_BM = 128, WMMA_BN = 64, WMMA_BK = 32;
-constexpr unsigned int WMMA_WM = 64, WMMA_WN = 32, WMMA_THREADS = 128;
+constexpr unsigned int WMMA_BM = 128, WMMA_BN = 128, WMMA_BK = 32;
+constexpr unsigned int WMMA_WM = 64, WMMA_WN = 64, WMMA_THREADS = 128;
 constexpr unsigned int WMMA_AP = WMMA_BM + 16, WMMA_BP = WMMA_BN + 16;
 constexpr unsigned int WMMA_AS = WMMA_BK * WMMA_AP, WMMA_BS = WMMA_BK * WMMA_BP;
 
@@ -55,7 +55,7 @@ __global__ void wmma_convert_inputs(const float* src, half* dst,
     packed[1] = __floats2half2_rn(value.z, value.w);
 }
 
-__global__ __launch_bounds__(WMMA_THREADS, 3)
+__global__ __launch_bounds__(WMMA_THREADS, 2)
 void matrix_multiply_wmma_pipeline(const half* a, const half* b, float* __restrict__ c,
                                    unsigned int w, unsigned int h, unsigned int k)
 {
