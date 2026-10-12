@@ -1,3 +1,6 @@
+
+
+
 #include <libgpu/context.h>
 #include <libgpu/work_size.h>
 #include <libgpu/shared_device_buffer.h>
@@ -15,9 +18,14 @@
 
 namespace {
 namespace wmma = nvcuda::wmma;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+constexpr bool WMMA_VOLTA = true;
+#else
+constexpr bool WMMA_VOLTA = false;
+#endif
 constexpr unsigned int WMMA_BM = 128, WMMA_BN = 64, WMMA_BK = 32;
 constexpr unsigned int WMMA_WM = 64, WMMA_WN = 32, WMMA_THREADS = 128;
-constexpr unsigned int WMMA_AP = WMMA_BM + 16, WMMA_BP = WMMA_BN + 16;
+constexpr unsigned int WMMA_AP = WMMA_BM + (WMMA_VOLTA ? 0 : 16), WMMA_BP = WMMA_BN + (WMMA_VOLTA ? 0 : 16);
 constexpr unsigned int WMMA_AS = WMMA_BK * WMMA_AP, WMMA_BS = WMMA_BK * WMMA_BP;
 
 // Кэш для неизменных входов; после записи/освобождения A/B или очистки pool нужен clear_cache().
@@ -55,13 +63,26 @@ __global__ void wmma_convert_inputs(const float* src, half* dst,
         row = blockIdx.x * 32 + y;
         col = blockIdx.y * 32 + x;
     }
-    const size_t stride = TRANSPOSE ? paddedRows : paddedCols;
-    half2* packed = reinterpret_cast<half2*>(dst + size_t(row) * stride + col);
-    packed[0] = __floats2half2_rn(value.x, value.y);
-    packed[1] = __floats2half2_rn(value.z, value.w);
+    if constexpr (WMMA_VOLTA) {
+        constexpr unsigned tileWidth = TRANSPOSE ? WMMA_BM : WMMA_BN;
+        const unsigned kTiles = (TRANSPOSE ? paddedCols : paddedRows) / WMMA_BK;
+        const size_t tile = size_t(col / tileWidth) * kTiles + row / WMMA_BK;
+        const unsigned r = col % tileWidth, t = row % WMMA_BK;
+        const unsigned offset = (t / 8) * tileWidth * 8 + (r / 16) * 128
+                              + ((r / 4) % 2) * 64 + ((r / 8) % 2) * 32
+                              + (t % 4) * 8 + ((t / 4) % 2) * 4 + r % 4;
+        half2* packed = reinterpret_cast<half2*>(dst + tile * WMMA_BK * tileWidth + offset);
+        packed[0] = __floats2half2_rn(value.x, value.y);
+        packed[1] = __floats2half2_rn(value.z, value.w);
+    } else {
+        const size_t stride = TRANSPOSE ? paddedRows : paddedCols;
+        half2* packed = reinterpret_cast<half2*>(dst + size_t(row) * stride + col);
+        packed[0] = __floats2half2_rn(value.x, value.y);
+        packed[1] = __floats2half2_rn(value.z, value.w);
+    }
 }
 
-__global__ __launch_bounds__(WMMA_THREADS, 3)
+__global__ __launch_bounds__(WMMA_THREADS, WMMA_VOLTA ? 4 : 3)
 void matrix_multiply_wmma_pipeline(const half* a, const half* b, float* __restrict__ c,
                                    unsigned int w, unsigned int h, unsigned int k)
 {
@@ -75,23 +96,35 @@ void matrix_multiply_wmma_pipeline(const half* a, const half* b, float* __restri
     const unsigned int warpY = warp / (WMMA_BN / WMMA_WN);
     const unsigned int warpX = warp % (WMMA_BN / WMMA_WN);
 
+    const half* aPanel = a + size_t(blockIdx.x) * k * WMMA_BM;
+    const half* bPanel = b + size_t(blockIdx.y) * k * WMMA_BN;
     auto prefetch = [&](unsigned int baseK) {
         #pragma unroll
         for (unsigned int p = 0; p < LOADS; ++p) {
             const unsigned int index = (tid + p * WMMA_THREADS) * 8;
             if (p < LOAD_A) nextA[p] = *reinterpret_cast<const int4*>(
+                WMMA_VOLTA ? aPanel + size_t(baseK) * WMMA_BM + index :
                 a + size_t(baseK + index / WMMA_BM) * h + blockY + index % WMMA_BM);
             if (p < LOAD_B) nextB[p] = *reinterpret_cast<const int4*>(
+                WMMA_VOLTA ? bPanel + size_t(baseK) * WMMA_BN + index :
                 b + size_t(baseK + index / WMMA_BN) * w + blockX + index % WMMA_BN);
         }
     };
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    const unsigned lane = tid % 32, group = (lane / 4) % 4;
+    const unsigned groupRow = (group / 2) * 8, groupCol = (group % 2) * 8;
+    const unsigned halfGroup = (lane / 16) * 4;
+    float acc[WMMA_WM / 16][WMMA_WN / 16][8] = {};
+#else
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[WMMA_WM / 16][WMMA_WN / 16];
     #pragma unroll
     for (unsigned int i = 0; i < WMMA_WM / 16; ++i) {
         #pragma unroll
         for (unsigned int j = 0; j < WMMA_WN / 16; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
     }
+
+#endif
 
     prefetch(0);
     unsigned int stage = 0;
@@ -102,13 +135,46 @@ void matrix_multiply_wmma_pipeline(const half* a, const half* b, float* __restri
         for (unsigned int p = 0; p < LOADS; ++p) {
             const unsigned int index = (tid + p * WMMA_THREADS) * 8;
             if (p < LOAD_A) *reinterpret_cast<int4*>(
-                tileA + (index / WMMA_BM) * WMMA_AP + index % WMMA_BM) = nextA[p];
+                tileA + (WMMA_VOLTA ? index : (index / WMMA_BM) * WMMA_AP + index % WMMA_BM)) = nextA[p];
             if (p < LOAD_B) *reinterpret_cast<int4*>(
-                tileB + (index / WMMA_BN) * WMMA_BP + index % WMMA_BN) = nextB[p];
+                tileB + (WMMA_VOLTA ? index : (index / WMMA_BN) * WMMA_BP + index % WMMA_BN)) = nextB[p];
         }
         __syncthreads();
         if (baseK + WMMA_BK < k) prefetch(baseK + WMMA_BK);
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+        #pragma unroll
+        for (unsigned q = 0; q < WMMA_BK; q += 8) {
+            uint4 br[WMMA_WN / 16];
+            #pragma unroll
+            for (unsigned j = 0; j < WMMA_WN / 16; ++j)
+                br[j] = *reinterpret_cast<const uint4*>(tileB + (q / 8) * WMMA_BN * 8
+                    + (warpX * WMMA_WN / 16 + j) * 128 + (groupCol / 8) * 32
+                    + (halfGroup / 4) * 64 + (lane % 4) * 8);
+            #pragma unroll
+            for (unsigned i = 0; i < WMMA_WM / 16; ++i) {
+                const uint4 ar = *reinterpret_cast<const uint4*>(tileA + (q / 8) * WMMA_BM * 8
+                    + (warpY * WMMA_WM / 16 + i) * 128 + (groupRow / 8) * 32
+                    + (halfGroup / 4) * 64 + (lane % 4) * 8);
+                #pragma unroll
+                for (unsigned halfK = 0; halfK < 2; ++halfK) {
+                    #pragma unroll
+                    for (unsigned j = 0; j < WMMA_WN / 16; ++j) {
+                        float* d = acc[i][j];
+                        const uint2 aa = halfK ? make_uint2(ar.z, ar.w) : make_uint2(ar.x, ar.y);
+                        const uint2 bb = halfK ? make_uint2(br[j].z, br[j].w) : make_uint2(br[j].x, br[j].y);
+                        asm volatile("mma.sync.aligned.m8n8k4.col.row.f32.f16.f16.f32 "
+                            "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+                            "{%0,%1,%2,%3,%4,%5,%6,%7};"
+                            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
+                              "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+                            : "r"(aa.x), "r"(aa.y), "r"(bb.x), "r"(bb.y));
+                    }
+                }
+            }
+        }
+
+#else
         #pragma unroll
         for (unsigned int q = 0; q < WMMA_BK; q += 16) {
             wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> ar[WMMA_WM / 16];
@@ -126,9 +192,32 @@ void matrix_multiply_wmma_pipeline(const half* a, const half* b, float* __restri
                     wmma::mma_sync(acc[i][j], ar[i], br[j], acc[i][j]);
             }
         }
+    
+#endif
         stage ^= 1;
     }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    #pragma unroll
+    for (unsigned i = 0; i < WMMA_WM / 16; ++i) {
+        #pragma unroll
+        for (unsigned j = 0; j < WMMA_WN / 16; ++j) {
+            #pragma unroll
+            for (unsigned r = 0; r < 4; r += 2) {
+                const float* d = acc[i][j] + r;
+                const bool right = lane & 2;
+                const float a = right ? d[4] : d[0], b = right ? d[5] : d[1];
+                const float u = __shfl_xor_sync(0xffffffffu, right ? d[0] : d[4], 2);
+                const float v = __shfl_xor_sync(0xffffffffu, right ? d[1] : d[5], 2);
+                const unsigned row = blockY + warpY * WMMA_WM + i * 16 + groupRow + halfGroup + (lane & 1) + r;
+                const unsigned col = blockX + warpX * WMMA_WN + j * 16 + groupCol + (right ? 4 : 0);
+                *reinterpret_cast<float4*>(c + size_t(row) * w + col) = right
+                    ? make_float4(u, v, a, b) : make_float4(a, b, u, v);
+            }
+        }
+    }
+
+#else
     #pragma unroll
     for (unsigned int i = 0; i < WMMA_WM / 16; ++i) {
         #pragma unroll
@@ -137,6 +226,8 @@ void matrix_multiply_wmma_pipeline(const half* a, const half* b, float* __restri
                                    + blockX + warpX * WMMA_WN + j * 16,
                                    acc[i][j], w, wmma::mem_row_major);
     }
+
+#endif
 }
 } // namespace
 
@@ -157,7 +248,7 @@ static void matrix_multiply_wmma_impl(const gpu::WorkSize& workSize,
     if (w && h) {
         const unsigned paddedH = ((h + WMMA_BM - 1) / WMMA_BM) * WMMA_BM;
         const unsigned paddedW = ((w + WMMA_BN - 1) / WMMA_BN) * WMMA_BN;
-        const unsigned paddedK = k ? ((k + WMMA_BK - 1) / WMMA_BK) * WMMA_BK : WMMA_BK;
+        const unsigned paddedK = k ? ((k + 31) / 32) * 32 : 32;
         auto& pool = context.memoryPool();
         auto aHalf = pool.allocateN<half>("matrix.wmma.a", size_t(paddedH) * paddedK);
         auto bHalf = pool.allocateN<half>("matrix.wmma.b", size_t(paddedK) * paddedW);
