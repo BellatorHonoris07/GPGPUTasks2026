@@ -274,3 +274,4 @@ void matrix_multiply_wmma(const gpu::WorkSize& workSize,
 
 void matrix_multiply_wmma_clear_cache() { cachedWmmaInputs = {}; }
 }
+ 
