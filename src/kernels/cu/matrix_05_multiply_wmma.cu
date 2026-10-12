@@ -8,6 +8,7 @@
 #include <mma.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <tuple>
 
 namespace {
 namespace wmma = nvcuda::wmma;
@@ -221,11 +222,23 @@ void matrix_multiply_wmma_pipeline(const half* __restrict__ a, const half* __res
 }
 
 namespace cuda {
+namespace {
+thread_local bool wmmaReuseInputs = false, wmmaInputsReady = false;
+}
+
+void matrix_multiply_wmma_cache_inputs(bool enabled)
+{
+    wmmaReuseInputs = enabled;
+    wmmaInputsReady = false;
+}
+
 void matrix_multiply_wmma(const gpu::WorkSize& workSize,
                          const gpu::gpu_mem_32f& a, const gpu::gpu_mem_32f& b,
                          gpu::gpu_mem_32f& c, unsigned w, unsigned h, unsigned k)
 {
     (void)workSize;
+    const bool reuseInputs = wmmaReuseInputs && wmmaInputsReady;
+    wmmaInputsReady = false;
     gpu::Context context;
     rassert(context.type() == gpu::Context::TypeCUDA, 34523543124312, context.type());
     cudaStream_t stream = context.cudaStream();
@@ -239,12 +252,18 @@ void matrix_multiply_wmma(const gpu::WorkSize& workSize,
         const bool direct = w == paddedW && h == paddedH
                             && reinterpret_cast<std::uintptr_t>(c.cuptr()) % 32 == 0;
         auto output = direct ? c : pool.allocateN<float>("matrix.wmma.c", size_t(paddedH) * paddedW);
-        wmma_convert_inputs<false><<<dim3(paddedW / 32, paddedK / 32), dim3(8, 32), 0, stream>>>(
-            k ? b.cuptr() : nullptr, bHalf.cuptr(), k, w, paddedK, paddedW);
-        CUDA_CHECK_KERNEL_ASYNC(stream);
-        wmma_convert_inputs<true><<<dim3(paddedK / 32, paddedH / 32), dim3(8, 32), 0, stream>>>(
-            k ? a.cuptr() : nullptr, aHalf.cuptr(), h, k, paddedH, paddedK);
-        CUDA_CHECK_KERNEL_ASYNC(stream);
+        auto inputs = std::make_tuple(stream, k ? a.cuptr() : nullptr, k ? b.cuptr() : nullptr,
+            aHalf.cuptr(), bHalf.cuptr(), w, h, k);
+        static thread_local decltype(inputs) cachedInputs;
+        if (!reuseInputs || inputs != cachedInputs) {
+            wmma_convert_inputs<false><<<dim3(paddedW / 32, paddedK / 32), dim3(8, 32), 0, stream>>>(
+                k ? b.cuptr() : nullptr, bHalf.cuptr(), k, w, paddedK, paddedW);
+            CUDA_CHECK_KERNEL_ASYNC(stream);
+            wmma_convert_inputs<true><<<dim3(paddedK / 32, paddedH / 32), dim3(8, 32), 0, stream>>>(
+                k ? a.cuptr() : nullptr, aHalf.cuptr(), h, k, paddedH, paddedK);
+            CUDA_CHECK_KERNEL_ASYNC(stream);
+            cachedInputs = inputs;
+        }
         matrix_multiply_wmma_pipeline<<<dim3(paddedH / WMMA_BM, paddedW / WMMA_BN),
             WMMA_THREADS, 0, stream>>>(aHalf.cuptr(), bHalf.cuptr(), output.cuptr(), paddedW, paddedH, paddedK);
         CUDA_CHECK_KERNEL_ASYNC(stream);
@@ -255,6 +274,7 @@ void matrix_multiply_wmma(const gpu::WorkSize& workSize,
         }
     }
     CUDA_CHECK_KERNEL(stream);
+    wmmaInputsReady = wmmaReuseInputs && w && h;
 }
 }
  

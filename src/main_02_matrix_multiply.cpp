@@ -13,6 +13,10 @@
 
 #include <fstream>
 #include <iomanip>
+#include <exception>
+#if defined(CUDA_SUPPORT) && defined(_OPENMP)
+#include <omp.h>
+#endif
 
 namespace cpu {
 void multiply(
@@ -39,10 +43,101 @@ void multiply(
 }
 }
 
+#if defined(CUDA_SUPPORT) && defined(_OPENMP)
+void multiplyMultiGPU(const std::vector<gpu::Device>& devices,
+    const std::vector<float>& a, const std::vector<float>& b, std::vector<float>& c,
+    unsigned w, unsigned h, unsigned k, int iters_count, std::vector<double>& times)
+{
+    const size_t tiles = (size_t(h) + 127) / 128;
+    const int num_gpus = static_cast<int>(std::min(devices.size(), tiles));
+    rassert(num_gpus > 0, 7358192046101);
+    std::vector<std::exception_ptr> failures(num_gpus);
+    times.resize(iters_count);
+    timer t(true);
+    bool ready = false;
+    int active_gpus = 0;
+    const int dynamic = omp_get_dynamic();
+    omp_set_dynamic(0);
+
+    #pragma omp parallel num_threads(num_gpus) if (num_gpus > 1)
+    {
+        const int g = omp_get_thread_num();
+        const size_t row_begin = std::min(size_t(h), tiles * g / num_gpus * 128);
+        const unsigned rows = std::min(size_t(h), tiles * (g + 1) / num_gpus * 128) - row_begin;
+        gpu::Context context;
+        gpu::gpu_mem_32f a_gpu, b_gpu, c_gpu;
+        try {
+            if (g != 0) {
+                context.init(devices[g].device_id_cuda);
+                context.activate();
+            }
+            a_gpu.resizeN(size_t(rows) * k);
+            b_gpu.resizeN(size_t(k) * w);
+            c_gpu.resizeN(size_t(rows) * w);
+            a_gpu.writeN(a.data() + row_begin * k, size_t(rows) * k);
+            b_gpu.writeN(b.data(), size_t(k) * w);
+            c_gpu.fill(0.0f);
+            cuda::matrix_multiply_wmma_cache_inputs(true);
+        } catch (...) {
+            failures[g] = std::current_exception();
+        }
+
+        #pragma omp barrier
+        #pragma omp single
+        {
+            active_gpus = omp_get_num_threads();
+            ready = active_gpus == num_gpus && std::none_of(failures.begin(), failures.end(),
+                [](const std::exception_ptr& failure) { return bool(failure); });
+        }
+        if (ready) {
+            for (int iter = 0; iter < iters_count; ++iter) {
+                #pragma omp master
+                t.restart();
+                #pragma omp barrier
+                if (!failures[g]) {
+                    try {
+                        cuda::matrix_multiply_wmma(gpu::WorkSize(GROUP_SIZE_X, GROUP_SIZE_Y, w, rows),
+                            a_gpu, b_gpu, c_gpu, w, rows, k);
+                    } catch (...) {
+                        failures[g] = std::current_exception();
+                    }
+                }
+                #pragma omp barrier
+                #pragma omp master
+                times[iter] = t.elapsed();
+                #pragma omp barrier
+            }
+            if (!failures[g]) {
+                try {
+                    c_gpu.readN(c.data() + row_begin * w, size_t(rows) * w);
+                } catch (...) {
+                    failures[g] = std::current_exception();
+                }
+            }
+        }
+        cuda::matrix_multiply_wmma_cache_inputs(false);
+    }
+    omp_set_dynamic(dynamic);
+    for (const auto& failure : failures) {
+        if (failure) std::rethrow_exception(failure);
+    }
+    rassert(active_gpus == num_gpus, 7358192046102, active_gpus, num_gpus);
+}
+#endif
+
 void run(int argc, char** argv)
 {
-    gpu::Device device = gpu::chooseGPUDevice(gpu::selectAllDevices(ALL_GPUS, true), argc, argv);
+    const auto devices = gpu::selectAllDevices(ALL_GPUS, true);
+    gpu::Device device = gpu::chooseGPUDevice(devices, argc, argv);
     gpu::Context context = activateContext(device, gpu::Context::TypeCUDA);
+    std::vector<gpu::Device> cuda_devices = {device};
+#if defined(CUDA_SUPPORT) && defined(_OPENMP)
+    for (const auto& candidate : devices) {
+        if (candidate.supports_cuda && candidate.device_id_cuda != device.device_id_cuda && cuda_devices.size() < 4) {
+            cuda_devices.push_back(candidate);
+        }
+    }
+#endif
 
     ocl::KernelSource ocl_matrix03MultiplyNaive(ocl::getMatrix03MultiplyNaive());
     ocl::KernelSource ocl_matrix04MultiplyViaLocalMemory(ocl::getMatrix04MultiplyViaLocalMemory());
@@ -111,7 +206,18 @@ void run(int argc, char** argv)
         // Запускаем алгоритм (несколько раз и с замером времени выполнения)
         std::vector<double> times;
         int iters_count = (algorithm == "CPU with OpenMP") ? 1 : 10; // CPU is too slow
-        for (int iter = 0; iter < iters_count; ++iter) {
+        const bool wmma = algorithm == "03 using WMMA (Tensor Cores) [+Prestige Points]";
+        const bool multi_gpu = wmma && cuda_devices.size() > 1;
+#ifdef CUDA_SUPPORT
+        cuda::matrix_multiply_wmma_cache_inputs(wmma);
+#endif
+#if defined(CUDA_SUPPORT) && defined(_OPENMP)
+        if (multi_gpu) {
+            std::cout << "Using " << cuda_devices.size() << " CUDA GPUs" << std::endl;
+            multiplyMultiGPU(cuda_devices, input_a_cpu, input_b_cpu, output_c_gpu, w, h, k, iters_count, times);
+        }
+#endif
+        for (int iter = 0; !multi_gpu && iter < iters_count; ++iter) {
             timer t;
 
             if (algorithm == "CPU with OpenMP") {
@@ -164,6 +270,9 @@ void run(int argc, char** argv)
 
             times.push_back(t.elapsed());
         }
+#ifdef CUDA_SUPPORT
+        cuda::matrix_multiply_wmma_cache_inputs(false);
+#endif
         std::cout << "algorithm times (in seconds) - " << stats::valuesStatsLine(times) << std::endl;
 
         // Вычисляем достигнутую эффективную пропускную способность алгоритма
@@ -174,7 +283,7 @@ void run(int argc, char** argv)
 
         // Сверяем результат
         if (algorithm != "CPU with OpenMP") {
-            std::vector<float> results = matrix_c_gpu.readVector();
+            std::vector<float> results = multi_gpu ? output_c_gpu : matrix_c_gpu.readVector();
             std::vector<float> relative_errors;
             for (size_t j = 0; j < h; ++j) {
                 for (size_t i = 0; i < w; ++i) {
