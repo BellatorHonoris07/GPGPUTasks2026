@@ -80,7 +80,7 @@ __global__ void wmma_convert_inputs(const float* src, half* dst,
 }
 
 __global__ __launch_bounds__(WMMA_THREADS, WMMA_VOLTA ? 4 : 3)
-void matrix_multiply_wmma_pipeline(const half* a, const half* b, float* __restrict__ c,
+void matrix_multiply_wmma_pipeline(const half* __restrict__ a, const half* __restrict__ b, float* __restrict__ c,
                                    unsigned int w, unsigned int h, unsigned int k)
 {
     __shared__ __align__(32) half aBase[2 * WMMA_AS], bBase[2 * WMMA_BS];
