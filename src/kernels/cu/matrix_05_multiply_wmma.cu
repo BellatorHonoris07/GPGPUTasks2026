@@ -17,7 +17,7 @@ constexpr bool WMMA_VOLTA = true;
 constexpr bool WMMA_VOLTA = false;
 #endif
 constexpr unsigned int WMMA_BM = 128, WMMA_BN = 128, WMMA_BK = 32;
-constexpr unsigned int WMMA_WM = 64, WMMA_WN = 64, WMMA_THREADS = 128;
+constexpr unsigned int WMMA_WM = 64, WMMA_WN = 32, WMMA_THREADS = 256;
 constexpr unsigned int WMMA_AP = WMMA_BM + (WMMA_VOLTA ? 0 : 16), WMMA_BP = WMMA_BN + (WMMA_VOLTA ? 0 : 16);
 constexpr unsigned int WMMA_AS = WMMA_BK * WMMA_AP, WMMA_BS = WMMA_BK * WMMA_BP;
 
