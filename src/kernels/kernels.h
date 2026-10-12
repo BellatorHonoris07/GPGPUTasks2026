@@ -28,6 +28,7 @@ void matrix_multiply_via_local_memory(const gpu::WorkSize &workSize,
 void matrix_multiply_wmma(const gpu::WorkSize &workSize,
             const gpu::gpu_mem_32f &a, const gpu::gpu_mem_32f &b, gpu::gpu_mem_32f &c, unsigned int w, unsigned int h, unsigned int k);
 #ifdef CUDA_SUPPORT
+void matrix_multiply_wmma_clear_cache(); // После изменения/освобождения входов или очистки pool.
 void matrix_multiply_wmma_diagnose(const gpu::WorkSize &workSize,
             const gpu::gpu_mem_32f &a, const gpu::gpu_mem_32f &b, gpu::gpu_mem_32f &c, unsigned int w, unsigned int h, unsigned int k);
 #endif

@@ -11,13 +11,19 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <cstdio>
+#include <tuple>
 
 namespace {
 namespace wmma = nvcuda::wmma;
-constexpr unsigned int WMMA_BM = 128, WMMA_BN = 128, WMMA_BK = 32;
-constexpr unsigned int WMMA_WM = 64, WMMA_WN = 64, WMMA_THREADS = 128;
+constexpr unsigned int WMMA_BM = 128, WMMA_BN = 64, WMMA_BK = 32;
+constexpr unsigned int WMMA_WM = 64, WMMA_WN = 32, WMMA_THREADS = 128;
 constexpr unsigned int WMMA_AP = WMMA_BM + 16, WMMA_BP = WMMA_BN + 16;
 constexpr unsigned int WMMA_AS = WMMA_BK * WMMA_AP, WMMA_BS = WMMA_BK * WMMA_BP;
+
+// Кэш для неизменных входов; после записи/освобождения A/B или очистки pool нужен clear_cache().
+using WmmaInputKey = std::tuple<const gpu::device_memory_pool*, cudaStream_t,
+                               const float*, const float*, const half*, const half*, unsigned, unsigned, unsigned>;
+thread_local WmmaInputKey cachedWmmaInputs{};
 
 template<bool TRANSPOSE>
 __global__ void wmma_convert_inputs(const float* src, half* dst,
@@ -55,7 +61,7 @@ __global__ void wmma_convert_inputs(const float* src, half* dst,
     packed[1] = __floats2half2_rn(value.z, value.w);
 }
 
-__global__ __launch_bounds__(WMMA_THREADS, 2)
+__global__ __launch_bounds__(WMMA_THREADS, 3)
 void matrix_multiply_wmma_pipeline(const half* a, const half* b, float* __restrict__ c,
                                    unsigned int w, unsigned int h, unsigned int k)
 {
@@ -145,6 +151,9 @@ static void matrix_multiply_wmma_impl(const gpu::WorkSize& workSize,
     gpu::Context context;
     rassert(context.type() == gpu::Context::TypeCUDA, 34523543124312, context.type());
     cudaStream_t stream = context.cudaStream();
+    const WmmaInputKey previous = cachedWmmaInputs;
+    WmmaInputKey current{};
+    cachedWmmaInputs = {}; // Восстанавливаем ключ только после успешного завершения вызова.
     if (w && h) {
         const unsigned paddedH = ((h + WMMA_BM - 1) / WMMA_BM) * WMMA_BM;
         const unsigned paddedW = ((w + WMMA_BN - 1) / WMMA_BN) * WMMA_BN;
@@ -152,17 +161,24 @@ static void matrix_multiply_wmma_impl(const gpu::WorkSize& workSize,
         auto& pool = context.memoryPool();
         auto aHalf = pool.allocateN<half>("matrix.wmma.a", size_t(paddedH) * paddedK);
         auto bHalf = pool.allocateN<half>("matrix.wmma.b", size_t(paddedK) * paddedW);
+        current = {&pool, stream, k ? a.cuptr() : nullptr, k ? b.cuptr() : nullptr,
+                   aHalf.cuptr(), bHalf.cuptr(), w, h, k};
+        const bool prepare = current != previous;
         const bool direct = w == paddedW && h == paddedH
                             && reinterpret_cast<std::uintptr_t>(c.cuptr()) % 32 == 0;
         auto output = direct ? c : pool.allocateN<float>("matrix.wmma.c", size_t(paddedH) * paddedW);
         if constexpr (PROFILE) CUDA_SAFE_CALL(cudaEventRecord(events[0], stream));
-        wmma_convert_inputs<false><<<dim3(paddedW / 32, paddedK / 32), dim3(8, 32), 0, stream>>>(
-            k ? b.cuptr() : nullptr, bHalf.cuptr(), k, w, paddedK, paddedW);
-        CUDA_CHECK_KERNEL_ASYNC(stream);
+        if (prepare) {
+            wmma_convert_inputs<false><<<dim3(paddedW / 32, paddedK / 32), dim3(8, 32), 0, stream>>>(
+                k ? b.cuptr() : nullptr, bHalf.cuptr(), k, w, paddedK, paddedW);
+            CUDA_CHECK_KERNEL_ASYNC(stream);
+        }
         if constexpr (PROFILE) CUDA_SAFE_CALL(cudaEventRecord(events[1], stream));
-        wmma_convert_inputs<true><<<dim3(paddedK / 32, paddedH / 32), dim3(8, 32), 0, stream>>>(
-            k ? a.cuptr() : nullptr, aHalf.cuptr(), h, k, paddedH, paddedK);
-        CUDA_CHECK_KERNEL_ASYNC(stream);
+        if (prepare) {
+            wmma_convert_inputs<true><<<dim3(paddedK / 32, paddedH / 32), dim3(8, 32), 0, stream>>>(
+                k ? a.cuptr() : nullptr, aHalf.cuptr(), h, k, paddedH, paddedK);
+            CUDA_CHECK_KERNEL_ASYNC(stream);
+        }
         if constexpr (PROFILE) CUDA_SAFE_CALL(cudaEventRecord(events[2], stream));
         matrix_multiply_wmma_pipeline<<<dim3(paddedH / WMMA_BM, paddedW / WMMA_BN),
             WMMA_THREADS, 0, stream>>>(aHalf.cuptr(), bHalf.cuptr(), output.cuptr(), paddedW, paddedH, paddedK);
@@ -176,7 +192,10 @@ static void matrix_multiply_wmma_impl(const gpu::WorkSize& workSize,
         if constexpr (PROFILE) CUDA_SAFE_CALL(cudaEventRecord(events[4], stream));
     }
     CUDA_CHECK_KERNEL(stream);
+    cachedWmmaInputs = current;
 }
+
+void matrix_multiply_wmma_clear_cache() { cachedWmmaInputs = {}; }
 
 void matrix_multiply_wmma(const gpu::WorkSize& workSize,
                          const gpu::gpu_mem_32f& a, const gpu::gpu_mem_32f& b,
