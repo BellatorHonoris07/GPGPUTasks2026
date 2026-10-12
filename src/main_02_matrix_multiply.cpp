@@ -194,12 +194,6 @@ void run(int argc, char** argv)
             rassert(perc99_relative_error < 1e-1f, 54623452334232, perc99_relative_error);
         }
     }
-#ifdef CUDA_SUPPORT
-    // Временная диагностика после всех штатных замеров и проверок.
-    if (context.type() == gpu::Context::TypeCUDA)
-        cuda::matrix_multiply_wmma_diagnose(gpu::WorkSize(GROUP_SIZE_X, GROUP_SIZE_Y, w, h),
-                                          matrix_a_gpu, matrix_b_gpu, matrix_c_gpu, w, h, k);
-#endif
 }
 
 int main(int argc, char** argv)

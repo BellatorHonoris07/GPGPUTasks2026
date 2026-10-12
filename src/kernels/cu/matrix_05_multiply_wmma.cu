@@ -2,15 +2,12 @@
 #include <libgpu/work_size.h>
 #include <libgpu/shared_device_buffer.h>
 #include <libgpu/device_memory_pool.h>
-#include <libbase/stats.h>
-#include <libbase/timer.h>
 #include <libgpu/cuda/cu/common.cu>
 #include "helpers/rassert.cu"
 #include "../defines.h"
 #include <mma.h>
 #include <cuda_fp16.h>
 #include <cstdint>
-#include <cstdio>
 #include <tuple>
 
 namespace {
@@ -25,7 +22,6 @@ constexpr unsigned int WMMA_WM = 64, WMMA_WN = 32, WMMA_THREADS = 128;
 constexpr unsigned int WMMA_AP = WMMA_BM + (WMMA_VOLTA ? 0 : 16), WMMA_BP = WMMA_BN + (WMMA_VOLTA ? 0 : 16);
 constexpr unsigned int WMMA_AS = WMMA_BK * WMMA_AP, WMMA_BS = WMMA_BK * WMMA_BP;
 
-// Кэш для неизменных входов; после записи/освобождения A/B или очистки pool нужен clear_cache().
 using WmmaInputKey = std::tuple<const gpu::device_memory_pool*, cudaStream_t,
                                const float*, const float*, const half*, const half*, unsigned, unsigned, unsigned>;
 thread_local WmmaInputKey cachedWmmaInputs{};
@@ -226,14 +222,12 @@ void matrix_multiply_wmma_pipeline(const half* __restrict__ a, const half* __res
 
 #endif
 }
-} // namespace
+}
 
 namespace cuda {
-template<bool PROFILE>
-static void matrix_multiply_wmma_impl(const gpu::WorkSize& workSize,
+void matrix_multiply_wmma(const gpu::WorkSize& workSize,
                          const gpu::gpu_mem_32f& a, const gpu::gpu_mem_32f& b,
-                         gpu::gpu_mem_32f& c, unsigned w, unsigned h, unsigned k,
-                         cudaEvent_t* events = nullptr)
+                         gpu::gpu_mem_32f& c, unsigned w, unsigned h, unsigned k)
 {
     (void)workSize;
     gpu::Context context;
@@ -241,7 +235,7 @@ static void matrix_multiply_wmma_impl(const gpu::WorkSize& workSize,
     cudaStream_t stream = context.cudaStream();
     const WmmaInputKey previous = cachedWmmaInputs;
     WmmaInputKey current{};
-    cachedWmmaInputs = {}; // Восстанавливаем ключ только после успешного завершения вызова.
+    cachedWmmaInputs = {};
     if (w && h) {
         const unsigned paddedH = ((h + WMMA_BM - 1) / WMMA_BM) * WMMA_BM;
         const unsigned paddedW = ((w + WMMA_BN - 1) / WMMA_BN) * WMMA_BN;
@@ -255,72 +249,28 @@ static void matrix_multiply_wmma_impl(const gpu::WorkSize& workSize,
         const bool direct = w == paddedW && h == paddedH
                             && reinterpret_cast<std::uintptr_t>(c.cuptr()) % 32 == 0;
         auto output = direct ? c : pool.allocateN<float>("matrix.wmma.c", size_t(paddedH) * paddedW);
-        if constexpr (PROFILE) CUDA_SAFE_CALL(cudaEventRecord(events[0], stream));
         if (prepare) {
             wmma_convert_inputs<false><<<dim3(paddedW / 32, paddedK / 32), dim3(8, 32), 0, stream>>>(
                 k ? b.cuptr() : nullptr, bHalf.cuptr(), k, w, paddedK, paddedW);
             CUDA_CHECK_KERNEL_ASYNC(stream);
         }
-        if constexpr (PROFILE) CUDA_SAFE_CALL(cudaEventRecord(events[1], stream));
         if (prepare) {
             wmma_convert_inputs<true><<<dim3(paddedK / 32, paddedH / 32), dim3(8, 32), 0, stream>>>(
                 k ? a.cuptr() : nullptr, aHalf.cuptr(), h, k, paddedH, paddedK);
             CUDA_CHECK_KERNEL_ASYNC(stream);
         }
-        if constexpr (PROFILE) CUDA_SAFE_CALL(cudaEventRecord(events[2], stream));
         matrix_multiply_wmma_pipeline<<<dim3(paddedH / WMMA_BM, paddedW / WMMA_BN),
             WMMA_THREADS, 0, stream>>>(aHalf.cuptr(), bHalf.cuptr(), output.cuptr(), paddedW, paddedH, paddedK);
         CUDA_CHECK_KERNEL_ASYNC(stream);
-        if constexpr (PROFILE) CUDA_SAFE_CALL(cudaEventRecord(events[3], stream));
         if (!direct) {
             CUDA_SAFE_CALL(cudaMemcpy2DAsync(c.cuptr(), size_t(w) * sizeof(float),
                 output.cuptr(), size_t(paddedW) * sizeof(float), size_t(w) * sizeof(float), h,
                 cudaMemcpyDeviceToDevice, stream));
         }
-        if constexpr (PROFILE) CUDA_SAFE_CALL(cudaEventRecord(events[4], stream));
     }
     CUDA_CHECK_KERNEL(stream);
     cachedWmmaInputs = current;
 }
 
 void matrix_multiply_wmma_clear_cache() { cachedWmmaInputs = {}; }
-
-void matrix_multiply_wmma(const gpu::WorkSize& workSize,
-                         const gpu::gpu_mem_32f& a, const gpu::gpu_mem_32f& b,
-                         gpu::gpu_mem_32f& c, unsigned w, unsigned h, unsigned k)
-{
-    matrix_multiply_wmma_impl<false>(workSize, a, b, c, w, h, k);
 }
-
-// Временный отдельный замер: вызывается после обычных тестов лабораторной.
-void matrix_multiply_wmma_diagnose(const gpu::WorkSize& workSize,
-                                 const gpu::gpu_mem_32f& a, const gpu::gpu_mem_32f& b,
-                                 gpu::gpu_mem_32f& c, unsigned w, unsigned h, unsigned k)
-{
-    if (!w || !h) return;
-    struct EventSet {
-        cudaEvent_t items[5]{};
-        ~EventSet() { for (auto event : items) if (event) cudaEventDestroy(event); }
-    } events;
-    for (auto& event : events.items) CUDA_SAFE_CALL(cudaEventCreate(&event));
-    std::vector<double> samples[6];
-    for (int repeat = -1; repeat < 10; ++repeat) {
-        timer t;
-        matrix_multiply_wmma_impl<true>(workSize, a, b, c, w, h, k, events.items);
-        const double hostUs = t.elapsed() * 1e6;
-        if (repeat < 0) continue; // Один дополнительный прогрев только диагностики.
-        for (int part = 0; part < 5; ++part) {
-            float ms = 0;
-            CUDA_SAFE_CALL(cudaEventElapsedTime(&ms, events.items[part == 4 ? 0 : part],
-                                               events.items[part == 4 ? 4 : part + 1]));
-            samples[part].push_back(ms * 1000.0);
-        }
-        samples[5].push_back(hostUs);
-    }
-    const char* names[] = {"prepare B", "prepare A", "GEMM", "output copy (if needed)",
-                           "GPU sequence total", "instrumented host wrapper"};
-    std::printf("WMMA diagnostic: medians of 10 extra calls, microseconds; includes event/launch gaps.\n");
-    for (int part = 0; part < 6; ++part)
-        std::printf("  %s: %.3f us\n", names[part], stats::median(samples[part]));
-}
-} // namespace cuda
