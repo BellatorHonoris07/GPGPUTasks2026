@@ -11,8 +11,8 @@
 
 namespace {
 namespace wmma = nvcuda::wmma;
-constexpr unsigned int WMMA_BM = 128, WMMA_BN = 64, WMMA_BK = 32;
-constexpr unsigned int WMMA_WM = 64, WMMA_WN = 32, WMMA_THREADS = 128;
+constexpr unsigned int WMMA_BM = 128, WMMA_BN = 128, WMMA_BK = 32;
+constexpr unsigned int WMMA_WM = 64, WMMA_WN = 32, WMMA_THREADS = 256;
 constexpr unsigned int WMMA_AP = WMMA_BM + 16, WMMA_BP = WMMA_BN + 16;
 constexpr unsigned int WMMA_AS = WMMA_BK * WMMA_AP, WMMA_BS = WMMA_BK * WMMA_BP;
 
@@ -46,13 +46,16 @@ __global__ void wmma_convert_inputs(const float* src, half* dst,
         row = blockIdx.x * 32 + y;
         col = blockIdx.y * 32 + x;
     }
-    const size_t stride = TRANSPOSE ? paddedRows : paddedCols;
-    half2* packed = reinterpret_cast<half2*>(dst + size_t(row) * stride + col);
+    constexpr unsigned tileWidth = TRANSPOSE ? WMMA_BM : WMMA_BN;
+    const unsigned kTiles = (TRANSPOSE ? paddedCols : paddedRows) / WMMA_BK;
+    const size_t tile = size_t(col / tileWidth) * kTiles + row / WMMA_BK;
+    half2* packed = reinterpret_cast<half2*>(dst + tile * WMMA_BK * tileWidth
+                                            + (row % WMMA_BK) * tileWidth + col % tileWidth);
     packed[0] = __floats2half2_rn(value.x, value.y);
     packed[1] = __floats2half2_rn(value.z, value.w);
 }
 
-__global__ __launch_bounds__(WMMA_THREADS, 3)
+__global__ __launch_bounds__(WMMA_THREADS, 2)
 void matrix_multiply_wmma_pipeline(const half* a, const half* b, float* __restrict__ c,
                                    unsigned int w, unsigned int h, unsigned int k)
 {
@@ -66,14 +69,16 @@ void matrix_multiply_wmma_pipeline(const half* a, const half* b, float* __restri
     const unsigned int warpY = warp / (WMMA_BN / WMMA_WN);
     const unsigned int warpX = warp % (WMMA_BN / WMMA_WN);
 
+    const half* aPanel = a + size_t(blockIdx.x) * k * WMMA_BM;
+    const half* bPanel = b + size_t(blockIdx.y) * k * WMMA_BN;
     auto prefetch = [&](unsigned int baseK) {
         #pragma unroll
         for (unsigned int p = 0; p < LOADS; ++p) {
             const unsigned int index = (tid + p * WMMA_THREADS) * 8;
             if (p < LOAD_A) nextA[p] = *reinterpret_cast<const int4*>(
-                a + size_t(baseK + index / WMMA_BM) * h + blockY + index % WMMA_BM);
+                aPanel + size_t(baseK) * WMMA_BM + index);
             if (p < LOAD_B) nextB[p] = *reinterpret_cast<const int4*>(
-                b + size_t(baseK + index / WMMA_BN) * w + blockX + index % WMMA_BN);
+                bPanel + size_t(baseK) * WMMA_BN + index);
         }
     };
 
