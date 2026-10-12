@@ -59,9 +59,10 @@ __global__ void wmma_convert_inputs(const float* src, half* dst,
         const unsigned offset = (t / 8) * tileWidth * 8 + (r / 16) * 128
                               + ((r / 4) % 2) * 64 + ((r / 8) % 2) * 32
                               + (t % 4) * 8 + ((t / 4) % 2) * 4 + r % 4;
-        half2* packed = reinterpret_cast<half2*>(dst + tile * WMMA_BK * tileWidth + offset);
-        packed[0] = __floats2half2_rn(value.x, value.y);
-        packed[1] = __floats2half2_rn(value.z, value.w);
+        const __half2_raw lo = __floats2half2_rn(value.x, value.y);
+        const __half2_raw hi = __floats2half2_rn(value.z, value.w);
+        *reinterpret_cast<uint2*>(dst + tile * WMMA_BK * tileWidth + offset) = make_uint2(
+            unsigned(lo.x) | (unsigned(lo.y) << 16), unsigned(hi.x) | (unsigned(hi.y) << 16));
     } else {
         const size_t stride = TRANSPOSE ? paddedRows : paddedCols;
         half2* packed = reinterpret_cast<half2*>(dst + size_t(row) * stride + col);
