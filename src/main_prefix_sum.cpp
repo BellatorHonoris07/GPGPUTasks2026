@@ -11,7 +11,7 @@
 #include <fstream>
 #include <exception>
 #ifdef CUDA_SUPPORT
-#include <cuda_runtime.h>
+#include <libgpu/cuda/cuda_api.h>
 #endif
 #ifdef _OPENMP
 #include <omp.h>
@@ -22,9 +22,12 @@ std::vector<unsigned> scanOnDevices(const std::vector<gpu::Device>& devices,
 {
     rassert(!devices.empty() && iterations > 0
         && input.size() <= std::numeric_limits<unsigned>::max(), 7419301043);
-    const int requested = int(std::min(devices.size(), std::max(size_t(1), input.size())));
-    std::vector<unsigned> output(input.size()), totals(requested);
+    const int requested = int(std::min({devices.size(), std::max(size_t(1), input.size()), size_t(4)}));
+    std::vector<unsigned> output(input.size());
+    std::vector<const unsigned*> totals(requested);
+    std::vector<cudaContext_t> peer_contexts(requested);
     std::vector<std::exception_ptr> failures(requested);
+    bool ready = false;
     times.resize(iterations);
     timer t(true);
     #pragma omp parallel num_threads(requested) if(requested > 1)
@@ -37,7 +40,7 @@ std::vector<unsigned> scanOnDevices(const std::vector<gpu::Device>& devices,
         const size_t begin = input.size() * g / count;
         const unsigned n = input.size() * (g + 1) / count - begin;
         gpu::Context context;
-        gpu::gpu_mem_32u in, out;
+        gpu::gpu_mem_32u in, out, total;
         auto attempt = [&](auto action) {
             if (failures[g]) return;
             try { action(); }
@@ -47,27 +50,43 @@ std::vector<unsigned> scanOnDevices(const std::vector<gpu::Device>& devices,
             if (g) { context.init(devices[g].device_id_cuda); context.activate(); }
             in.resizeN(n); out.resizeN(n);
             if (n) in.writeN(input.data() + begin, n);
+            if (count > 1) {
+                total.resizeN(1);
+                totals[g] = total.cuptr();
+                CU_SAFE_CALL(cuCtxGetCurrent(&peer_contexts[g]));
+
+            }
         });
+        #pragma omp barrier
+        attempt([&] {
+            for (int previous = 0; previous < g; ++previous) {
+                rassert(peer_contexts[previous], 7419301046);
+                cuda::reportErrorCU(cuCtxEnablePeerAccess(peer_contexts[previous], 0), __LINE__,
+                    "Direct GPU peer access is required (no CPU fallback): ");
+            }
+        });
+        #pragma omp barrier
         #pragma omp single
-        { std::cout << "Prefix sum on " << count << " CUDA GPU(s)" << std::endl; }
-        for (int iter = -1; iter < iterations; ++iter) {
+        {
+            ready = std::none_of(failures.begin(), failures.end(), [](const auto& e) { return bool(e); });
+            if (ready) std::cout << "Prefix sum on " << count << " CUDA GPU(s)"
+                                 << (count > 1 ? ", direct peer exchange" : "") << std::endl;
+        }
+        for (int iter = -1; ready && iter < iterations; ++iter) {
             #pragma omp single
             { t.restart(); }
             attempt([&] {
-                cuda::prefix_sum(in, out, n);
-                if (count > 1 && g + 1 < count) out.readN(&totals[g], 1, n - 1);
+                cuda::prefix_sum(in, out, n, 0, count > 1 ? total.cuptr() : nullptr);
             });
             #pragma omp barrier
             attempt([&] {
-                unsigned offset = 0;
-                for (int previous = 0; previous < g; ++previous) offset += totals[previous];
-                cuda::prefix_sum_add_offset(out, n, offset);
+                cuda::prefix_sum_add_offsets(out, n, totals.data(), g);
             });
             #pragma omp barrier
             #pragma omp single
             { if (iter >= 0) times[iter] = t.elapsed(); }
         }
-        attempt([&] {
+        if (ready) attempt([&] {
             if (n) out.readN(output.data() + begin, n);
             const auto unchanged = in.readVector();
             for (unsigned i = 0; i < n; ++i)

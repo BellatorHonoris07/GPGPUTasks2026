@@ -31,12 +31,13 @@ void prefix_sum_01_reduction(const gpu::WorkSize &workSize,
     rassert(false, 54623523412413);
 }
 void prefix_sum(const gpu::gpu_mem_32u& input, gpu::gpu_mem_32u& output,
-                unsigned int n, unsigned int initial)
+                unsigned int n, unsigned int initial, unsigned* total)
 {
     // dummy implementation if CUDA_SUPPORT is disabled
     rassert(false, 546237686412414);
 }
-void prefix_sum_add_offset(gpu::gpu_mem_32u& output, unsigned n, unsigned offset)
+void prefix_sum_add_offsets(gpu::gpu_mem_32u& output, unsigned n,
+                            const unsigned* const* totals, unsigned count)
 {
     rassert(false, 7419301042);
 }
