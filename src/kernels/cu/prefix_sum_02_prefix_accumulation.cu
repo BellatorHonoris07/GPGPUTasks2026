@@ -10,6 +10,10 @@ namespace prefix_scan {
 constexpr unsigned threads = GROUP_SIZE, vectors = PREFIX_SUM_VECTORS, warps = threads / 32;
 constexpr unsigned tile_size = threads * vectors * 4;
 static_assert(threads % 32 == 0 && warps * vectors == 32);
+__global__ void add_offset(unsigned* output, unsigned n, unsigned offset) {
+    const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < n) output[index] += offset;
+}
 __device__ unsigned warp_scan(unsigned value) {
     #pragma unroll
     for (unsigned d = 1; d < 32; d *= 2) {
@@ -71,6 +75,14 @@ __global__ void scan_tiles(const unsigned* input, unsigned* output, unsigned n,
 } // namespace prefix_scan
 
 namespace cuda {
+void prefix_sum_add_offset(gpu::gpu_mem_32u& output, unsigned n, unsigned offset) {
+    if (!n || !offset) return;
+    gpu::Context context;
+    rassert(context.type() == gpu::Context::TypeCUDA && output.size() >= size_t(n) * sizeof(unsigned), 7419301041);
+    const cudaStream_t stream = context.cudaStream();
+    prefix_scan::add_offset<<<(size_t(n) + 255) / 256, 256, 0, stream>>>(output.cuptr(), n, offset);
+    CUDA_CHECK_KERNEL_SYNC(stream);
+}
 void prefix_sum(const gpu::gpu_mem_32u& input, gpu::gpu_mem_32u& output,
                 unsigned int n, unsigned int initial) {
     if (!n) return;

@@ -9,6 +9,77 @@
 #include "kernels/kernels.h"
 
 #include <fstream>
+#include <exception>
+#ifdef CUDA_SUPPORT
+#include <cuda_runtime.h>
+#endif
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+std::vector<unsigned> scanOnDevices(const std::vector<gpu::Device>& devices,
+    const std::vector<unsigned>& input, std::vector<double>& times, int iterations = 10)
+{
+    rassert(!devices.empty() && iterations > 0
+        && input.size() <= std::numeric_limits<unsigned>::max(), 7419301043);
+    const int requested = int(std::min(devices.size(), std::max(size_t(1), input.size())));
+    std::vector<unsigned> output(input.size()), totals(requested);
+    std::vector<std::exception_ptr> failures(requested);
+    times.resize(iterations);
+    timer t(true);
+    #pragma omp parallel num_threads(requested) if(requested > 1)
+    {
+        int g = 0, count = 1;
+#ifdef _OPENMP
+        g = omp_get_thread_num();
+        count = omp_get_num_threads();
+#endif
+        const size_t begin = input.size() * g / count;
+        const unsigned n = input.size() * (g + 1) / count - begin;
+        gpu::Context context;
+        gpu::gpu_mem_32u in, out;
+        auto attempt = [&](auto action) {
+            if (failures[g]) return;
+            try { action(); }
+            catch (...) { failures[g] = std::current_exception(); }
+        };
+        attempt([&] {
+            if (g) { context.init(devices[g].device_id_cuda); context.activate(); }
+            in.resizeN(n); out.resizeN(n);
+            if (n) in.writeN(input.data() + begin, n);
+        });
+        #pragma omp single
+        { std::cout << "Prefix sum on " << count << " CUDA GPU(s)" << std::endl; }
+        for (int iter = -1; iter < iterations; ++iter) {
+            #pragma omp single
+            { t.restart(); }
+            attempt([&] {
+                cuda::prefix_sum(in, out, n);
+                if (count > 1 && g + 1 < count) out.readN(&totals[g], 1, n - 1);
+            });
+            #pragma omp barrier
+            attempt([&] {
+                unsigned offset = 0;
+                for (int previous = 0; previous < g; ++previous) offset += totals[previous];
+                cuda::prefix_sum_add_offset(out, n, offset);
+            });
+            #pragma omp barrier
+            #pragma omp single
+            { if (iter >= 0) times[iter] = t.elapsed(); }
+        }
+        attempt([&] {
+            if (n) out.readN(output.data() + begin, n);
+            const auto unchanged = in.readVector();
+            for (unsigned i = 0; i < n; ++i)
+                rassert(unchanged[i] == input[begin + i], 6573452432, i);
+        });
+#ifdef CUDA_SUPPORT
+        if (failures[g]) (void)cudaGetLastError();
+#endif
+    }
+    for (const auto& failure : failures) if (failure) std::rethrow_exception(failure);
+    return output;
+}
 
 void run(int argc, char** argv)
 {
@@ -18,7 +89,8 @@ void run(int argc, char** argv)
     // - Если доступно N>1 устройства:
     //   - Если аргументов запуска нет или переданное число не находится в диапазоне от 0 до N-1 - кинет ошибку
     //   - Если аргумент запуска есть и он от 0 до N-1 - вернет устройство под указанным номером
-    gpu::Device device = gpu::chooseGPUDevice(gpu::selectAllDevices(ALL_GPUS, true), argc, argv);
+    const auto available = gpu::selectAllDevices(ALL_GPUS, true);
+    gpu::Device device = gpu::chooseGPUDevice(available, argc, argv);
 
     // TODO 000 сделайте здесь свой выбор API - если он отличается от OpenCL то в этой строке нужно заменить TypeOpenCL на TypeCUDA или TypeVulkan
     // TODO 000 после этого изучите этот код, запустите его, изучите соответсвующий вашему выбору кернел - src/kernels/<ваш выбор>/aplusb.<ваш выбор>
@@ -26,6 +98,10 @@ void run(int argc, char** argv)
     // TODO 010 P.S. так же в случае CUDA - добавьте в CMake options (НЕ меняйте сами CMakeLists.txt чтобы не менять окружение тестирования):
     // TODO 010 "-DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CUDA_FLAGS=-lineinfo" (первое - чтобы включить поддержку WMMA, второе - чтобы compute-sanitizer и профилировщик знали номера строк кернела)
     gpu::Context context = activateContext(device, gpu::Context::TypeCUDA);
+    std::vector<gpu::Device> devices{device};
+    for (const auto& candidate : available)
+        if (candidate.supports_cuda && candidate.device_id_cuda != device.device_id_cuda && devices.size() < 4)
+            devices.push_back(candidate);
     // OpenCL - рекомендуется как вариант по умолчанию, можно выполнять на CPU, есть printf, есть аналог valgrind/cuda-memcheck - https://github.com/jrprice/Oclgrind
     // CUDA   - рекомендуется если у вас NVIDIA видеокарта, есть printf, т.к. в таком случае вы сможете пользоваться профилировщиком (nsight-compute) и санитайзером (compute-sanitizer, это бывший cuda-memcheck)
     // Vulkan - не рекомендуется, т.к. писать код (compute shaders) на шейдерном языке GLSL на мой взгляд менее приятно чем в случае OpenCL/CUDA
@@ -67,40 +143,8 @@ void run(int argc, char** argv)
                   << n / 1e6 / elapsed << " uint millions/s)" << std::endl;
     }
 
-    // Аллоцируем буферы в VRAM
-    gpu::gpu_mem_32u input_gpu(n), prefix_sum_accum_gpu(n);
-
-    // Прогружаем входные данные по PCI-E шине: CPU RAM -> GPU VRAM
-    input_gpu.writeN(as.data(), n);
-    cuda::prefix_sum(input_gpu, prefix_sum_accum_gpu, n);
-
-    // Запускаем кернел (несколько раз и с замером времени выполнения)
     std::vector<double> times;
-    for (int iter = 0; iter < 10; ++iter) {
-        timer t;
-
-        // Запускаем кернел, с указанием размера рабочего пространства и передачей всех аргументов
-        // Если хотите - можете удалить ветвление здесь и оставить только тот код который соответствует вашему выбору API
-        if (context.type() == gpu::Context::TypeOpenCL) {
-            // TODO
-            throw std::runtime_error(CODE_IS_NOT_IMPLEMENTED);
-            // ocl_fill_with_zeros.exec();
-            // ocl_sum_reduction.exec();
-            // ocl_prefix_accumulation.exec();
-        } else if (context.type() == gpu::Context::TypeCUDA) {
-            cuda::prefix_sum(input_gpu, prefix_sum_accum_gpu, n);
-        } else if (context.type() == gpu::Context::TypeVulkan) {
-            // TODO
-            throw std::runtime_error(CODE_IS_NOT_IMPLEMENTED);
-            // vk_fill_with_zeros.exec();
-            // vk_sum_reduction.exec();
-            // vk_prefix_accumulation.exec();
-        } else {
-            rassert(false, 4531412341, context.type());
-        }
-
-        times.push_back(t.elapsed());
-    }
+    const auto gpu_prefix_sum = scanOnDevices(devices, as, times);
     std::cout << "prefix sum times (in seconds) - " << stats::valuesStatsLine(times) << std::endl;
 
     // Вычисляем достигнутую эффективную пропускную способность видеопамяти (из соображений что мы отработали в один проход - считали массив и сохранили префиксные суммы)
@@ -109,19 +153,11 @@ void run(int argc, char** argv)
               << memory_size_gb / stats::median(times) << " GB/s ("
               << n / 1e6 / stats::median(times) << " uint millions/s)" << std::endl;
 
-    // Считываем результат по PCI-E шине: GPU VRAM -> CPU RAM
-    std::vector<unsigned int> gpu_prefix_sum = prefix_sum_accum_gpu.readVector();
-
     // Сверяем результат
     for (size_t i = 0; i < n; ++i) {
         rassert(cpu_prefix_sum[i] == gpu_prefix_sum[i], 566324523452323, cpu_prefix_sum[i], gpu_prefix_sum[i], i);
     }
 
-    // Проверяем что входные данные остались нетронуты (ведь мы их переиспользуем от итерации к итерации)
-    std::vector<unsigned int> input_values = input_gpu.readVector();
-    for (size_t i = 0; i < n; ++i) {
-        rassert(input_values[i] == as[i], 6573452432, input_values[i], as[i]);
-    }
 }
 
 int main(int argc, char** argv)

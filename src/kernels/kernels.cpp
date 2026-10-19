@@ -36,6 +36,10 @@ void prefix_sum(const gpu::gpu_mem_32u& input, gpu::gpu_mem_32u& output,
     // dummy implementation if CUDA_SUPPORT is disabled
     rassert(false, 546237686412414);
 }
+void prefix_sum_add_offset(gpu::gpu_mem_32u& output, unsigned n, unsigned offset)
+{
+    rassert(false, 7419301042);
+}
 } // namespace cuda
 #endif
 
