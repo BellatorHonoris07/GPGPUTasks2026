@@ -33,19 +33,23 @@ void radix_sort_01_local_counting(const gpu::WorkSize &workSize, const gpu::gpu_
     // dummy implementation if CUDA_SUPPORT is disabled
     rassert(false, 54623523412413);
 }
-void radix_sort_02_global_prefixes_scan_sum_reduction(const gpu::WorkSize &workSize, const gpu::gpu_mem_32u &buffer1, gpu::gpu_mem_32u &buffer2, unsigned int a1)
+void radix_sort_02_global_prefixes_scan_sum_reduction(const gpu::WorkSize &workSize, gpu::gpu_mem_32u &buffer1, gpu::gpu_mem_32u &buffer2, unsigned int a1)
 {
     // dummy implementation if CUDA_SUPPORT is disabled
     rassert(false, 54623523412413);
 }
-void radix_sort_03_global_prefixes_scan_accumulation(const gpu::WorkSize &workSize, const gpu::gpu_mem_32u &buffer1, gpu::gpu_mem_32u &buffer2, unsigned int a1, unsigned int a2)
+void radix_sort_03_global_prefixes_scan_accumulation(gpu::gpu_mem_32u &sums, unsigned int n)
 {
     // dummy implementation if CUDA_SUPPORT is disabled
     rassert(false, 54623523412413);
 }
-void radix_sort_04_scatter(const gpu::WorkSize &workSize, const gpu::gpu_mem_32u &values, const gpu::gpu_mem_32u &buffer1, gpu::gpu_mem_32u &buffer2, unsigned int a1, unsigned int a2)
+void radix_sort_04_scatter(const gpu::WorkSize &workSize, const gpu::gpu_mem_32u &values, const gpu::gpu_mem_32u &buffer1, const gpu::gpu_mem_32u &sums, gpu::gpu_mem_32u &buffer2, unsigned int a1, unsigned int a2)
 {
     // dummy implementation if CUDA_SUPPORT is disabled
+    rassert(false, 54623523412413);
+}
+void radix_sort(const gpu::gpu_mem_32u& input, gpu::gpu_mem_32u& output, unsigned int n)
+{
     rassert(false, 54623523412413);
 }
 } // namespace cuda
